@@ -1,0 +1,14 @@
+# Build intermediates & isolated test outputs
+build/
+obj/
+bin/
+.vs/
+
+# Temporary archives & local logs
+*.rar
+*.zip
+*.log
+*.user
+*.suo
+Thumbs.db
+Desktop.ini
