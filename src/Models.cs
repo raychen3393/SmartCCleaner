@@ -35,12 +35,21 @@ namespace SmartCCleaner
         public TargetKind Kind { get; set; }
         public int MinAgeMinutes { get; set; }
 
+        /// <summary>
+        /// 整包原子删除的层级（相对目标根目录）：
+        /// -1 = 按文件逐个删除（默认）；0 = 整个目标根目录视为一个整体；
+        /// N = 根目录下第 N 层子目录各自视为一个整体（如 NuGet 的 &lt;id&gt;\&lt;version&gt; 为 2）。
+        /// 一个整体要么完整删除，要么（有文件被占用/受保护时）完整保留，避免包缓存只删一半而损坏。
+        /// </summary>
+        public int AtomicUnitDepth { get; set; }
+
         public CleanTargetSpec()
         {
             SearchPattern = "*";
             Recursive = true;
             Kind = TargetKind.DirectoryContents;
             MinAgeMinutes = 0;
+            AtomicUnitDepth = -1;
         }
     }
 
@@ -73,6 +82,12 @@ namespace SmartCCleaner
         public bool IsRecycleBinEntry { get; set; }
         public bool IsAdvisory { get; set; }
         public string AdvisoryText { get; set; }
+
+        /// <summary>所属整包目录（仅 AtomicUnitDepth &gt;= 0 的目标会设置），为空表示按文件删除。</summary>
+        public string UnitRoot { get; set; }
+
+        /// <summary>来自扫描目标的「最近 N 分钟内修改的文件不清理」阈值，删除前会按当下时间重新校验。</summary>
+        public int MinAgeMinutes { get; set; }
     }
 
     public class RuleScanResult
@@ -136,7 +151,13 @@ namespace SmartCCleaner
         public DateTime StartedAt { get; set; }
         public DateTime FinishedAt { get; set; }
         public bool IsDryRun { get; set; }
+
+        /// <summary>真正从 C 盘释放的空间（仅统计彻底删除的文件）。</summary>
         public long FreedBytes { get; set; }
+
+        /// <summary>移入回收站的体积：回收站同样位于 C 盘，清空回收站之前并不释放空间。</summary>
+        public long RecycledBytes { get; set; }
+
         public int DeletedFiles { get; set; }
         public int RecycledFiles { get; set; }
         public int DeletedDirectories { get; set; }

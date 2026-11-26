@@ -10,6 +10,10 @@ namespace SmartCCleaner
         private const string SingleInstanceMutexName = "Local\\SmartCCleaner_SingleInstance_Mutex_v2";
         public const string MainWindowTitle = "C盘智清 (SmartCCleaner v2.0) - Windows 智能安全清理工具";
 
+        /// <summary>以管理员身份重启时附带的参数：新进程会等待旧实例退出后再接管单实例锁。</summary>
+        public const string ElevatedRestartArg = "--elevated-restart";
+        private const int ElevatedRestartWaitMilliseconds = 15000;
+
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         private static extern IntPtr FindWindowW(string lpClassName, string lpWindowName);
 
@@ -24,10 +28,23 @@ namespace SmartCCleaner
         [STAThread]
         public static void Main(string[] args)
         {
-            bool createdNew;
-            using (var mutex = new Mutex(true, SingleInstanceMutexName, out createdNew))
+            bool isElevatedRestart = false;
+            if (args != null)
             {
-                if (!createdNew)
+                for (int i = 0; i < args.Length; i++)
+                {
+                    if (string.Equals(args[i], ElevatedRestartArg, StringComparison.OrdinalIgnoreCase))
+                    {
+                        isElevatedRestart = true;
+                    }
+                }
+            }
+
+            using (SingleInstanceGate gate = SingleInstanceGate.Acquire(
+                SingleInstanceMutexName,
+                isElevatedRestart ? ElevatedRestartWaitMilliseconds : 0))
+            {
+                if (!gate.IsOwner)
                 {
                     IntPtr existing = FindWindowW(null, MainWindowTitle);
                     if (existing != IntPtr.Zero)

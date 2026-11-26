@@ -121,6 +121,7 @@ $compileArgs = @(
     (Join-Path $srcDir "CleanerEngine.cs"),
     (Join-Path $srcDir "UiTheme.cs"),
     (Join-Path $srcDir "MainWindow.cs"),
+    (Join-Path $srcDir "SingleInstanceGate.cs"),
     (Join-Path $srcDir "App.cs")
 )
 
@@ -220,6 +221,7 @@ $testArgs = @(
     (Join-Path $srcDir "CleanerEngine.cs"),
     (Join-Path $srcDir "UiTheme.cs"),
     (Join-Path $srcDir "Uninstaller.cs"),
+    (Join-Path $srcDir "SingleInstanceGate.cs"),
     (Join-Path $testDir "EngineTests.cs"),
     "/main:SmartCCleaner.Tests.EngineTests"
 )

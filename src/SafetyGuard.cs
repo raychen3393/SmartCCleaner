@@ -62,6 +62,7 @@ namespace SmartCCleaner
                 _writer.WriteLine(string.Format("结束时间: {0:yyyy-MM-dd HH:mm:ss}", report.FinishedAt));
                 _writer.WriteLine(string.Format("执行状态: {0}", report.WasCancelled ? "用户中途取消" : "已完成"));
                 _writer.WriteLine(string.Format("预计/实际释放空间: {0} ({1} 字节)", FormatHelper.FormatBytes(report.FreedBytes), report.FreedBytes));
+                _writer.WriteLine(string.Format("移入回收站: {0} ({1} 字节，仍占用 C 盘，清空回收站后才真正释放)", FormatHelper.FormatBytes(report.RecycledBytes), report.RecycledBytes));
                 _writer.WriteLine(string.Format("彻底删除: {0} | 移入回收站: {1} | 清理空目录: {2}",
                     report.DeletedFiles, report.RecycledFiles, report.DeletedDirectories));
                 _writer.WriteLine(string.Format("跳过总计: {0} (安全保护/白名单: {1}, 占用/权限不足: {2})",

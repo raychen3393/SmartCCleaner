@@ -376,10 +376,12 @@ namespace SmartCCleaner
                 RequiresAdmin = false,
                 Targets = new List<CleanTargetSpec>
                 {
-                    new CleanTargetSpec { PathPattern = Path.Combine(localAppData, "npm-cache"), Recursive = true },
-                    new CleanTargetSpec { PathPattern = Path.Combine(appData, "npm-cache"), Recursive = true },
-                    new CleanTargetSpec { PathPattern = Path.Combine(localAppData, @"Yarn\Cache"), Recursive = true },
-                    new CleanTargetSpec { PathPattern = Path.Combine(localAppData, "pnpm-cache"), Recursive = true }
+                    // _cacache 的 index 与 content 互相引用，按顶层目录整体删除
+                    new CleanTargetSpec { PathPattern = Path.Combine(localAppData, "npm-cache"), Recursive = true, AtomicUnitDepth = 1 },
+                    new CleanTargetSpec { PathPattern = Path.Combine(appData, "npm-cache"), Recursive = true, AtomicUnitDepth = 1 },
+                    // Yarn v1：v6\<package> 目录内的 .yarn-metadata.json 与包文件必须同生共死
+                    new CleanTargetSpec { PathPattern = Path.Combine(localAppData, @"Yarn\Cache"), Recursive = true, AtomicUnitDepth = 2 },
+                    new CleanTargetSpec { PathPattern = Path.Combine(localAppData, "pnpm-cache"), Recursive = true, AtomicUnitDepth = 1 }
                 }
             });
 
@@ -396,7 +398,8 @@ namespace SmartCCleaner
                 Targets = new List<CleanTargetSpec>
                 {
                     new CleanTargetSpec { PathPattern = Path.Combine(localAppData, @"pip\cache"), Recursive = true },
-                    new CleanTargetSpec { PathPattern = Path.Combine(localAppData, @"uv\cache"), Recursive = true }
+                    // uv 的各个 bucket 之间互相引用，整个缓存目录作为一个整体
+                    new CleanTargetSpec { PathPattern = Path.Combine(localAppData, @"uv\cache"), Recursive = true, AtomicUnitDepth = 0 }
                 }
             });
 
@@ -413,7 +416,8 @@ namespace SmartCCleaner
                 Targets = new List<CleanTargetSpec>
                 {
                     new CleanTargetSpec { PathPattern = Path.Combine(localAppData, @"NuGet\v3-cache"), Recursive = true },
-                    new CleanTargetSpec { PathPattern = Path.Combine(userProfile, @".nuget\packages"), Recursive = true }
+                    // <id>\<version> 为一个包：只删 dll 留下 .nupkg.metadata 会让 NuGet 误以为包已还原
+                    new CleanTargetSpec { PathPattern = Path.Combine(userProfile, @".nuget\packages"), Recursive = true, AtomicUnitDepth = 2 }
                 }
             });
 
@@ -429,8 +433,10 @@ namespace SmartCCleaner
                 RequiresAdmin = false,
                 Targets = new List<CleanTargetSpec>
                 {
-                    new CleanTargetSpec { PathPattern = Path.Combine(userProfile, @".gradle\caches"), Recursive = true },
-                    new CleanTargetSpec { PathPattern = Path.Combine(userProfile, @".m2\repository"), Recursive = true }
+                    // Gradle 缓存的元数据与文件交叉引用，且守护进程运行时持有锁：整体删除或整体保留
+                    new CleanTargetSpec { PathPattern = Path.Combine(userProfile, @".gradle\caches"), Recursive = true, AtomicUnitDepth = 0 },
+                    // Maven 按顶层 groupId 目录整体删除，保证同一构件的 pom/jar/校验文件一致
+                    new CleanTargetSpec { PathPattern = Path.Combine(userProfile, @".m2\repository"), Recursive = true, AtomicUnitDepth = 1 }
                 }
             });
 
@@ -464,7 +470,8 @@ namespace SmartCCleaner
                 AssociatedProcesses = new[] { "idea64", "pycharm64", "rider64", "webstorm64" },
                 Targets = new List<CleanTargetSpec>
                 {
-                    new CleanTargetSpec { PathPattern = Path.Combine(localAppData, @"JetBrains\*\caches"), Recursive = true },
+                    // IDE 索引是一套互相依赖的文件，整体删除（IDE 运行中会因占用而整体跳过）
+                    new CleanTargetSpec { PathPattern = Path.Combine(localAppData, @"JetBrains\*\caches"), Recursive = true, AtomicUnitDepth = 0 },
                     new CleanTargetSpec { PathPattern = Path.Combine(localAppData, @"JetBrains\*\log"), Recursive = true }
                 }
             });

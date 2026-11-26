@@ -299,7 +299,19 @@ namespace SmartCCleaner
                         ? DateTime.Now.AddMinutes(-spec.MinAgeMinutes)
                         : DateTime.MaxValue;
 
+                    int firstNewItem = result.Items.Count;
                     ScanDirectoryFast(dir, spec.SearchPattern, spec.Recursive, cutoff, seenFiles, result, cancellationToken);
+                    if (spec.MinAgeMinutes > 0)
+                    {
+                        for (int n = firstNewItem; n < result.Items.Count; n++)
+                        {
+                            result.Items[n].MinAgeMinutes = spec.MinAgeMinutes;
+                        }
+                    }
+                    if (spec.AtomicUnitDepth >= 0)
+                    {
+                        AssignUnitRoots(result.Items, firstNewItem, dir, spec.AtomicUnitDepth);
+                    }
                 }
             }
 
@@ -429,6 +441,45 @@ namespace SmartCCleaner
             }
         }
 
+        /// <summary>
+        /// Tags each newly scanned item with the package directory it belongs to.
+        /// depth 0 = the scan root itself; depth N = the N-th level directory under the root.
+        /// Files shallower than N stay file-level (UnitRoot = null).
+        /// </summary>
+        private static void AssignUnitRoots(List<ScannedFileItem> items, int startIndex, string rootDir, int depth)
+        {
+            string prefix = rootDir.TrimEnd('\\') + "\\";
+            for (int i = startIndex; i < items.Count; i++)
+            {
+                string full = items[i].FullPath;
+                if (!full.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
+
+                if (depth == 0)
+                {
+                    items[i].UnitRoot = rootDir;
+                    continue;
+                }
+
+                string rel = full.Substring(prefix.Length);
+                int pos = -1;
+                bool deepEnough = true;
+                for (int d = 0; d < depth; d++)
+                {
+                    pos = rel.IndexOf('\\', pos + 1);
+                    if (pos < 0)
+                    {
+                        deepEnough = false;
+                        break;
+                    }
+                }
+
+                if (deepEnough)
+                {
+                    items[i].UnitRoot = prefix + rel.Substring(0, pos);
+                }
+            }
+        }
+
         public static List<string> ExpandDirectoryWildcards(string pattern)
         {
             var results = new List<string>();
@@ -552,9 +603,26 @@ namespace SmartCCleaner
                             bool preferRecycleBin = options.MoveNonSafeToRecycleBin && ruleResult.Rule.Risk != RiskLevel.Safe;
 
                             long ruleFreed = 0;
+                            long ruleRecycledBytes = 0;
                             int ruleDeleted = 0;
                             int ruleRecycled = 0;
                             int ruleSkipped = 0;
+
+                            // 包缓存按整包处理：同一包目录下的文件要么一起删除，要么一起保留。
+                            var unitMembers = new Dictionary<string, List<ScannedFileItem>>(StringComparer.OrdinalIgnoreCase);
+                            for (int u = 0; u < ruleResult.Items.Count; u++)
+                            {
+                                ScannedFileItem candidate = ruleResult.Items[u];
+                                if (candidate.IsAdvisory || string.IsNullOrEmpty(candidate.UnitRoot)) continue;
+                                List<ScannedFileItem> bucket;
+                                if (!unitMembers.TryGetValue(candidate.UnitRoot, out bucket))
+                                {
+                                    bucket = new List<ScannedFileItem>();
+                                    unitMembers.Add(candidate.UnitRoot, bucket);
+                                }
+                                bucket.Add(candidate);
+                            }
+                            var handledUnits = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
                             for (int idx = 0; idx < ruleResult.Items.Count; idx++)
                             {
@@ -567,19 +635,34 @@ namespace SmartCCleaner
                                 ScannedFileItem item = ruleResult.Items[idx];
                                 if (item.IsAdvisory) continue;
 
-                                processed++;
-                                if (progress != null && (processed == 1 || processed % 15 == 0 || processed == totalActionable))
+                                if (!string.IsNullOrEmpty(item.UnitRoot))
                                 {
-                                    progress.Report(new CleanProgressInfo
-                                    {
-                                        ProcessedItems = processed,
-                                        TotalItems = Math.Max(totalActionable, 1),
-                                        CurrentRuleName = ruleResult.Rule.Name,
-                                        CurrentFilePath = item.FullPath,
-                                        FreedBytesSoFar = report.FreedBytes,
-                                        DeletedCount = report.DeletedFiles + report.RecycledFiles,
-                                        SkippedCount = report.SkippedFiles
-                                    });
+                                    if (!handledUnits.Add(item.UnitRoot)) continue;
+
+                                    List<ScannedFileItem> members = unitMembers[item.UnitRoot];
+                                    processed += members.Count;
+                                    ReportCleanProgress(progress, processed, totalActionable, ruleResult.Rule.Name, item.UnitRoot, report);
+
+                                    UnitCleanResult unit = ProcessUnit(item.UnitRoot, members, options.IsDryRun, preferRecycleBin, log);
+                                    ruleFreed += unit.FreedBytes;
+                                    ruleRecycledBytes += unit.RecycledBytes;
+                                    ruleDeleted += unit.DeletedFiles;
+                                    ruleRecycled += unit.RecycledFiles;
+                                    ruleSkipped += unit.SkippedFiles;
+                                    report.FreedBytes += unit.FreedBytes;
+                                    report.RecycledBytes += unit.RecycledBytes;
+                                    report.DeletedFiles += unit.DeletedFiles;
+                                    report.RecycledFiles += unit.RecycledFiles;
+                                    report.SkippedFiles += unit.SkippedFiles;
+                                    report.ProtectedSkippedFiles += unit.ProtectedSkippedFiles;
+                                    report.LockedOrDeniedFiles += unit.LockedFiles;
+                                    continue;
+                                }
+
+                                processed++;
+                                if (processed == 1 || processed % 15 == 0 || processed == totalActionable)
+                                {
+                                    ReportCleanProgress(progress, processed, totalActionable, ruleResult.Rule.Name, item.FullPath, report);
                                 }
 
                                 if (item.IsRecycleBinEntry)
@@ -646,48 +729,101 @@ namespace SmartCCleaner
 
                                 if (options.IsDryRun)
                                 {
-                                    ruleFreed += item.SizeBytes;
                                     if (preferRecycleBin)
                                     {
+                                        // 移入回收站不释放 C 盘空间（回收站也在 C 盘），单独统计。
+                                        ruleRecycledBytes += item.SizeBytes;
                                         ruleRecycled++;
+                                        report.RecycledBytes += item.SizeBytes;
                                         report.RecycledFiles++;
                                         if (log != null) log.WriteRecord(string.Format("[演练-移入回收站] {0} ({1})", item.FullPath, FormatHelper.FormatBytes(item.SizeBytes)));
                                     }
                                     else
                                     {
+                                        ruleFreed += item.SizeBytes;
                                         ruleDeleted++;
+                                        report.FreedBytes += item.SizeBytes;
                                         report.DeletedFiles++;
                                         if (log != null) log.WriteRecord(string.Format("[演练-删除] {0} ({1})", item.FullPath, FormatHelper.FormatBytes(item.SizeBytes)));
                                     }
-                                    report.FreedBytes += item.SizeBytes;
                                 }
                                 else
                                 {
-                                    if (!NativeFileScanner.FileExistsFast(item.FullPath)) continue;
+                                    string errMsg = null;
+                                    bool recycled = false;
 
-                                    string errMsg;
-                                    if (preferRecycleBin && NativeFileScanner.TryMoveToRecycleBin(item.FullPath, out errMsg))
+                                    // 「最近 N 分钟内修改的文件不清理」按删除这一刻重新计算，而不是沿用扫描时的结果：
+                                    // 扫描完成后窗口可能放了很久，期间被重新写入的文件已经是活动文件了。
+                                    DateTime modifiedNotAfterUtc = item.MinAgeMinutes > 0
+                                        ? DateTime.UtcNow.AddMinutes(-item.MinAgeMinutes)
+                                        : DateTime.MaxValue;
+
+                                    if (preferRecycleBin)
                                     {
-                                        ruleFreed += item.SizeBytes;
+                                        // 回收站移动由 Shell 按路径执行，无法走句柄删除：先用句柄校验真实路径以缩小竞态窗口。
+                                        // 该选项只作用于非「安全推荐」规则，这些目录都在当前用户自己的配置目录内，
+                                        // 其他低权限账户无法在其中布置目录联接。
+                                        SafeOpOutcome verify = NativeFileScanner.VerifyPath(item.FullPath, false, _guard, modifiedNotAfterUtc, out errMsg);
+                                        if (verify == SafeOpOutcome.AlreadyGone) continue;
+                                        if (verify == SafeOpOutcome.TooRecent)
+                                        {
+                                            ruleSkipped++;
+                                            report.SkippedFiles++;
+                                            report.ProtectedSkippedFiles++;
+                                            if (log != null) log.WriteRecord(string.Format("[跳过-近期修改] {0} ({1})", item.FullPath, errMsg));
+                                            continue;
+                                        }
+                                        if (verify == SafeOpOutcome.Redirected || verify == SafeOpOutcome.Protected)
+                                        {
+                                            ruleSkipped++;
+                                            report.SkippedFiles++;
+                                            report.ProtectedSkippedFiles++;
+                                            if (log != null) log.WriteRecord(string.Format("[安全拦截-路径校验] {0} -> {1}", item.FullPath, errMsg));
+                                            continue;
+                                        }
+                                        recycled = verify == SafeOpOutcome.Done && NativeFileScanner.TryMoveToRecycleBin(item.FullPath, out errMsg);
+                                    }
+
+                                    if (recycled)
+                                    {
+                                        ruleRecycledBytes += item.SizeBytes;
                                         ruleRecycled++;
-                                        report.FreedBytes += item.SizeBytes;
+                                        report.RecycledBytes += item.SizeBytes;
                                         report.RecycledFiles++;
                                         if (log != null) log.WriteRecord(string.Format("[已移入回收站] {0} ({1})", item.FullPath, FormatHelper.FormatBytes(item.SizeBytes)));
                                     }
-                                    else if (NativeFileScanner.TryDeleteFileLongPath(item.FullPath, out errMsg))
-                                    {
-                                        ruleFreed += item.SizeBytes;
-                                        ruleDeleted++;
-                                        report.FreedBytes += item.SizeBytes;
-                                        report.DeletedFiles++;
-                                        if (log != null) log.WriteRecord(string.Format("[已删除] {0} ({1})", item.FullPath, FormatHelper.FormatBytes(item.SizeBytes)));
-                                    }
                                     else
                                     {
-                                        ruleSkipped++;
-                                        report.SkippedFiles++;
-                                        report.LockedOrDeniedFiles++;
-                                        if (log != null) log.WriteRecord(string.Format("[跳过-占用或无权限] {0} ({1})", item.FullPath, errMsg));
+                                        SafeOpOutcome deleted = NativeFileScanner.TrySafeDelete(item.FullPath, false, _guard, modifiedNotAfterUtc, out errMsg);
+                                        if (deleted == SafeOpOutcome.Done)
+                                        {
+                                            ruleFreed += item.SizeBytes;
+                                            ruleDeleted++;
+                                            report.FreedBytes += item.SizeBytes;
+                                            report.DeletedFiles++;
+                                            if (log != null) log.WriteRecord(string.Format("[已删除] {0} ({1})", item.FullPath, FormatHelper.FormatBytes(item.SizeBytes)));
+                                        }
+                                        else if (deleted == SafeOpOutcome.Redirected || deleted == SafeOpOutcome.Protected)
+                                        {
+                                            ruleSkipped++;
+                                            report.SkippedFiles++;
+                                            report.ProtectedSkippedFiles++;
+                                            if (log != null) log.WriteRecord(string.Format("[安全拦截-路径校验] {0} -> {1}", item.FullPath, errMsg));
+                                        }
+                                        else if (deleted == SafeOpOutcome.TooRecent)
+                                        {
+                                            ruleSkipped++;
+                                            report.SkippedFiles++;
+                                            report.ProtectedSkippedFiles++;
+                                            if (log != null) log.WriteRecord(string.Format("[跳过-近期修改] {0} ({1})", item.FullPath, errMsg));
+                                        }
+                                        else if (deleted == SafeOpOutcome.Failed)
+                                        {
+                                            ruleSkipped++;
+                                            report.SkippedFiles++;
+                                            report.LockedOrDeniedFiles++;
+                                            if (log != null) log.WriteRecord(string.Format("[跳过-占用或无权限] {0} ({1})", item.FullPath, errMsg));
+                                        }
                                     }
                                 }
                             }
@@ -700,8 +836,9 @@ namespace SmartCCleaner
                                 }
                             }
 
-                            report.RuleSummaries.Add(string.Format("- {0}: 释放 {1}，删除 {2}，回收站 {3}，跳过 {4}",
-                                ruleResult.Rule.Name, FormatHelper.FormatBytes(ruleFreed), ruleDeleted, ruleRecycled, ruleSkipped));
+                            report.RuleSummaries.Add(string.Format("- {0}: 释放 {1}，删除 {2}，移入回收站 {3} 个（{4}，未释放空间），跳过 {5}",
+                                ruleResult.Rule.Name, FormatHelper.FormatBytes(ruleFreed), ruleDeleted, ruleRecycled,
+                                FormatHelper.FormatBytes(ruleRecycledBytes), ruleSkipped));
                         }
                     }
                     finally
@@ -741,6 +878,204 @@ namespace SmartCCleaner
 
                 return report;
             });
+        }
+
+        private static void ReportCleanProgress(
+            IProgress<CleanProgressInfo> progress,
+            int processed,
+            int totalActionable,
+            string ruleName,
+            string currentPath,
+            CleanExecutionReport report)
+        {
+            if (progress == null) return;
+            progress.Report(new CleanProgressInfo
+            {
+                ProcessedItems = Math.Min(processed, Math.Max(totalActionable, 1)),
+                TotalItems = Math.Max(totalActionable, 1),
+                CurrentRuleName = ruleName,
+                CurrentFilePath = currentPath,
+                FreedBytesSoFar = report.FreedBytes,
+                DeletedCount = report.DeletedFiles + report.RecycledFiles,
+                SkippedCount = report.SkippedFiles
+            });
+        }
+
+        private class UnitCleanResult
+        {
+            public long FreedBytes;
+            public long RecycledBytes;
+            public int DeletedFiles;
+            public int RecycledFiles;
+            public int SkippedFiles;
+            public int ProtectedSkippedFiles;
+            public int LockedFiles;
+        }
+
+        /// <summary>
+        /// Returns the first entry inside the unit that must not be deleted (protected / whitelisted / reparse point),
+        /// or null when the whole unit can go. Walks the live tree so changes since the scan are honoured.
+        /// </summary>
+        private string FindUnitBlocker(string unitRoot, int minAgeMinutes)
+        {
+            DateTime freshCutoff = minAgeMinutes > 0 ? DateTime.Now.AddMinutes(-minAgeMinutes) : DateTime.MaxValue;
+            var stack = new Stack<string>();
+            stack.Push(unitRoot);
+            var children = new List<NativeFileEntry>(128);
+
+            while (stack.Count > 0)
+            {
+                string dir = stack.Pop();
+                children.Clear();
+                bool denied;
+                NativeFileScanner.TryEnumerateChildren(dir, "*", children, out denied);
+                if (denied) return dir + "（无权限枚举）";
+
+                for (int i = 0; i < children.Count; i++)
+                {
+                    NativeFileEntry entry = children[i];
+                    if (entry.IsReparsePoint) return entry.FullPath + "（符号链接/目录联接）";
+
+                    string reason;
+                    if (_guard.IsProtected(entry.FullPath, out reason)) return entry.FullPath + "（" + reason + "）";
+
+                    if (!entry.IsDirectory && entry.LastWriteTime > freshCutoff)
+                    {
+                        return entry.FullPath + "（最近修改过，仍在保护期内）";
+                    }
+
+                    if (entry.IsDirectory) stack.Push(entry.FullPath);
+                }
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Cleans one package directory as a single unit:
+        ///   1. skips the whole unit if anything inside is protected or a link;
+        ///   2. (recycle preference) moves the whole directory to the Recycle Bin in one shell call;
+        ///   3. otherwise atomically renames it to a hidden tombstone sibling — this fails as a whole when any file
+        ///      inside is in use, so a package is never left half-deleted — and then deletes the tombstone.
+        /// Once renamed, the package manager simply sees the package as missing and re-downloads it.
+        /// </summary>
+        private UnitCleanResult ProcessUnit(
+            string unitRoot,
+            List<ScannedFileItem> members,
+            bool isDryRun,
+            bool preferRecycleBin,
+            AuditLogSession log)
+        {
+            var result = new UnitCleanResult();
+            long scannedBytes = 0;
+            int unitMinAge = 0;
+            for (int i = 0; i < members.Count; i++)
+            {
+                scannedBytes += members[i].SizeBytes;
+                unitMinAge = Math.Max(unitMinAge, members[i].MinAgeMinutes);
+            }
+            int count = members.Count;
+
+            string reason;
+            if (_guard.IsProtected(unitRoot, out reason) || _guard.HasReparsePointInAncestorChain(unitRoot))
+            {
+                result.SkippedFiles = count;
+                result.ProtectedSkippedFiles = count;
+                if (log != null) log.WriteRecord(string.Format("[安全拦截-整包] {0} -> {1}", unitRoot, reason ?? "祖先目录含符号链接/目录联接"));
+                return result;
+            }
+
+            if (!Directory.Exists(unitRoot))
+            {
+                return result;
+            }
+
+            string blocker = FindUnitBlocker(unitRoot, unitMinAge);
+            if (blocker != null)
+            {
+                result.SkippedFiles = count;
+                result.ProtectedSkippedFiles = count;
+                if (log != null) log.WriteRecord(string.Format("[安全拦截-整包] {0}：包内含受保护项 {1}，整包保留以免只删一半", unitRoot, blocker));
+                return result;
+            }
+
+            if (isDryRun)
+            {
+                if (preferRecycleBin)
+                {
+                    result.RecycledFiles = count;
+                    result.RecycledBytes = scannedBytes;
+                    if (log != null) log.WriteRecord(string.Format("[演练-整包移入回收站] {0} ({1} 个文件, {2})", unitRoot, count, FormatHelper.FormatBytes(scannedBytes)));
+                }
+                else
+                {
+                    result.DeletedFiles = count;
+                    result.FreedBytes = scannedBytes;
+                    if (log != null) log.WriteRecord(string.Format("[演练-整包删除] {0} ({1} 个文件, {2})", unitRoot, count, FormatHelper.FormatBytes(scannedBytes)));
+                }
+                return result;
+            }
+
+            string detail;
+            if (preferRecycleBin)
+            {
+                // Same-volume Recycle Bin moves are a single directory rename: the whole package moves, or nothing does.
+                SafeOpOutcome verify = NativeFileScanner.VerifyPath(unitRoot, true, _guard, out detail);
+                if (verify == SafeOpOutcome.AlreadyGone) return result;
+                if (verify == SafeOpOutcome.Done && NativeFileScanner.TryMoveToRecycleBin(unitRoot, out detail))
+                {
+                    result.RecycledFiles = count;
+                    result.RecycledBytes = scannedBytes;
+                    if (log != null) log.WriteRecord(string.Format("[已整包移入回收站] {0} ({1} 个文件, {2})", unitRoot, count, FormatHelper.FormatBytes(scannedBytes)));
+                    return result;
+                }
+                if (verify == SafeOpOutcome.Redirected || verify == SafeOpOutcome.Protected)
+                {
+                    result.SkippedFiles = count;
+                    result.ProtectedSkippedFiles = count;
+                    if (log != null) log.WriteRecord(string.Format("[安全拦截-路径校验] {0} -> {1}", unitRoot, detail));
+                    return result;
+                }
+                if (log != null) log.WriteRecord(string.Format("[回收站不可用，改为整包删除] {0} ({1})", unitRoot, detail));
+            }
+
+            string leafName = Path.GetFileName(unitRoot);
+            string tombstoneLeaf = "." + leafName + ".sccdel-" + Guid.NewGuid().ToString("N").Substring(0, 8);
+            string tombstone;
+            SafeOpOutcome renamed = NativeFileScanner.TryRenameDirectorySafe(unitRoot, tombstoneLeaf, _guard, out tombstone, out detail);
+
+            if (renamed == SafeOpOutcome.AlreadyGone) return result;
+            if (renamed != SafeOpOutcome.Done)
+            {
+                result.SkippedFiles = count;
+                if (renamed == SafeOpOutcome.Failed)
+                {
+                    result.LockedFiles = count;
+                    if (log != null) log.WriteRecord(string.Format("[跳过-整包占用] {0}：{1}，整包保留以免只删一半", unitRoot, detail));
+                }
+                else
+                {
+                    result.ProtectedSkippedFiles = count;
+                    if (log != null) log.WriteRecord(string.Format("[安全拦截-整包] {0} -> {1}", unitRoot, detail));
+                }
+                return result;
+            }
+
+            var stats = new TreeDeleteStats();
+            NativeFileScanner.DeleteTreeSafe(tombstone, _guard, stats);
+            result.DeletedFiles = stats.DeletedFiles;
+            result.FreedBytes = stats.DeletedBytes;
+            if (log != null) log.WriteRecord(string.Format("[已整包删除] {0} ({1} 个文件, {2})", unitRoot, stats.DeletedFiles, FormatHelper.FormatBytes(stats.DeletedBytes)));
+
+            if (stats.Failures > 0 && log != null)
+            {
+                log.WriteRecord(string.Format("[整包残留] {0}：{1} 项未能删除（包已整体移出原位置，包管理器会按需重新下载）", tombstone, stats.Failures));
+                for (int i = 0; i < stats.Notes.Count; i++)
+                {
+                    log.WriteRecord("    - " + stats.Notes[i]);
+                }
+            }
+
+            return result;
         }
 
         private static bool TryTemporarilyStopService(string serviceName)
@@ -802,8 +1137,10 @@ namespace SmartCCleaner
 
                 deleted += RemoveEmptySubdirectoriesFast(entry.FullPath);
 
-                // Attempt Win32 RemoveDirectoryW (only succeeds if truly empty)
-                if (NativeFileScanner.TryRemoveEmptyDirectoryLongPath(entry.FullPath))
+                // Handle-validated delete (only succeeds if truly empty; refuses redirected paths,
+                // since even an arbitrary EMPTY-folder delete as admin is an escalation primitive).
+                string detail;
+                if (NativeFileScanner.TrySafeDelete(entry.FullPath, true, _guard, out detail) == SafeOpOutcome.Done)
                 {
                     deleted++;
                 }
