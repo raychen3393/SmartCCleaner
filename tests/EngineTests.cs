@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -151,6 +152,12 @@ namespace SmartCCleaner.Tests
                 Assert(UninstallCore.IsSafeRemovableAppFolder(@"D:\SmartCCleaner"), "Uninstaller allows SmartCCleaner folder");
                 Assert(UninstallCore.IsSafeRemovableAppFolder(@"D:\SmartCCleaner\dist"), "Uninstaller allows dist folder");
 
+                RunAtomicUnitTests(guard, engine, sandboxRoot);
+                RunRecycleAccountingTests(engine, sandboxRoot);
+                RunJunctionSwapTests(guard, engine, sandboxRoot);
+                RunAgeRecheckTests(engine, sandboxRoot);
+                RunSingleInstanceGateTests();
+
                 Console.WriteLine(string.Format("\nRESULT: {0} passed, {1} failed.", _passed, _failed));
                 return _failed == 0 ? 0 : 1;
             }
@@ -166,6 +173,275 @@ namespace SmartCCleaner.Tests
                 catch
                 {
                 }
+            }
+        }
+
+        // 10. Package caches are deleted as whole units: never half-deleted
+        private static void RunAtomicUnitTests(SafetyGuard guard, CleanerEngine engine, string sandboxRoot)
+        {
+            string pkgRoot = Path.Combine(sandboxRoot, "FakeNuget");
+            string fooVer = Path.Combine(pkgRoot, "foo", "1.0.0");
+            string barVer = Path.Combine(pkgRoot, "bar", "2.0.0");
+            string bazVer = Path.Combine(pkgRoot, "baz", "3.0.0");
+            Directory.CreateDirectory(Path.Combine(fooVer, "lib"));
+            Directory.CreateDirectory(barVer);
+            Directory.CreateDirectory(bazVer);
+
+            string fooDll = Path.Combine(fooVer, "lib", "foo.dll");
+            string fooMarker = Path.Combine(fooVer, "foo.1.0.0.nupkg.metadata");
+            string barDll = Path.Combine(barVer, "bar.dll");
+            string bazDll = Path.Combine(bazVer, "baz.dll");
+            string bazKeep = Path.Combine(bazVer, "keep.lock");
+            File.WriteAllText(fooDll, new string('D', 8192));
+            File.WriteAllText(fooMarker, "{}");
+            File.WriteAllText(barDll, new string('E', 1000));
+            File.WriteAllText(bazDll, new string('F', 500));
+            File.WriteAllText(bazKeep, "whitelisted");
+            File.SetAttributes(barDll, FileAttributes.ReadOnly);
+            guard.AddWhitelistEntry(bazKeep, "Test whitelist inside a package unit");
+
+            var unitRule = new CleanRule
+            {
+                Id = "test_unit_rule",
+                Name = "Test Package Unit Rule",
+                Category = CleanCategory.DevTools,
+                Risk = RiskLevel.Medium,
+                DefaultSelected = true,
+                Targets = new List<CleanTargetSpec>
+                {
+                    new CleanTargetSpec { PathPattern = pkgRoot, Recursive = true, AtomicUnitDepth = 2 }
+                }
+            };
+
+            RuleScanResult scan = engine.ScanSingleRule(unitRule, CancellationToken.None);
+            ScannedFileItem dllItem = scan.Items.FirstOrDefault(x => string.Equals(x.FullPath, fooDll, StringComparison.OrdinalIgnoreCase));
+            Assert(dllItem != null && string.Equals(dllItem.UnitRoot, fooVer, StringComparison.OrdinalIgnoreCase),
+                "Files under <id>\\<version> must be tagged with their package unit root");
+
+            CleanExecutionReport lockedReport;
+            using (new FileStream(fooMarker, FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                // The small marker file is in use: the large dll must NOT be deleted on its own.
+                lockedReport = engine.CleanAsync(
+                    new List<RuleScanResult> { scan },
+                    new CleanOptions { IsDryRun = false, MoveNonSafeToRecycleBin = false },
+                    null,
+                    CancellationToken.None).Result;
+            }
+
+            Assert(File.Exists(fooDll) && File.Exists(fooMarker), "A package with a locked file must be kept whole (dll not deleted alone)");
+            Assert(!Directory.Exists(barVer), "An unlocked package unit (incl. read-only file) must be deleted entirely");
+            Assert(File.Exists(bazDll) && File.Exists(bazKeep), "A package containing a whitelisted file must be kept whole");
+            Assert(lockedReport.LockedOrDeniedFiles >= 2, string.Format("Locked package should count its files as locked, got {0}", lockedReport.LockedOrDeniedFiles));
+            Assert(lockedReport.FreedBytes == 1000, string.Format("Only the bar package (1000 bytes) should be freed, got {0}", lockedReport.FreedBytes));
+
+            RuleScanResult rescan = engine.ScanSingleRule(unitRule, CancellationToken.None);
+            CleanExecutionReport secondReport = engine.CleanAsync(
+                new List<RuleScanResult> { rescan },
+                new CleanOptions { IsDryRun = false, MoveNonSafeToRecycleBin = false },
+                null,
+                CancellationToken.None).Result;
+
+            Assert(!Directory.Exists(fooVer), "Once unlocked, the whole package unit must be deleted");
+            Assert(!Directory.Exists(Path.Combine(pkgRoot, "foo")), "Empty package id folder should be cleaned afterwards");
+            Assert(Directory.GetDirectories(pkgRoot, "*.sccdel-*", SearchOption.AllDirectories).Length == 0, "No tombstone folders may be left behind");
+            Assert(secondReport.DeletedFiles == 2, string.Format("Second clean should delete the 2 files of foo, got {0}", secondReport.DeletedFiles));
+        }
+
+        // 11. Recycle Bin moves are NOT counted as freed space
+        private static void RunRecycleAccountingTests(CleanerEngine engine, string sandboxRoot)
+        {
+            string dir = Path.Combine(sandboxRoot, "RecycleAccounting");
+            Directory.CreateDirectory(dir);
+            File.WriteAllText(Path.Combine(dir, "cache.bin"), new string('R', 3000));
+
+            var mediumRule = new CleanRule
+            {
+                Id = "test_medium_rule",
+                Name = "Test Medium Rule",
+                Category = CleanCategory.CommonApps,
+                Risk = RiskLevel.Medium,
+                DefaultSelected = true,
+                Targets = new List<CleanTargetSpec> { new CleanTargetSpec { PathPattern = dir, Recursive = true } }
+            };
+
+            RuleScanResult scan = engine.ScanSingleRule(mediumRule, CancellationToken.None);
+            CleanExecutionReport dry = engine.CleanAsync(
+                new List<RuleScanResult> { scan },
+                new CleanOptions { IsDryRun = true, MoveNonSafeToRecycleBin = true },
+                null,
+                CancellationToken.None).Result;
+
+            Assert(dry.FreedBytes == 0, string.Format("Recycle-bin-bound files must not count as freed, got {0}", dry.FreedBytes));
+            Assert(dry.RecycledBytes == 3000 && dry.RecycledFiles == 1, string.Format("Recycle-bin-bound bytes must be reported separately, got {0}", dry.RecycledBytes));
+        }
+
+        // 12. Junction swapped into an ancestor between scan and clean must not redirect deletion
+        private static void RunJunctionSwapTests(SafetyGuard guard, CleanerEngine engine, string sandboxRoot)
+        {
+            string swapRoot = Path.Combine(sandboxRoot, "SwapTarget");
+            string swapSub = Path.Combine(swapRoot, "sub");
+            string outside = Path.Combine(sandboxRoot, "Outside");
+            Directory.CreateDirectory(swapSub);
+            Directory.CreateDirectory(Path.Combine(outside, "emptydir"));
+            File.WriteAllText(Path.Combine(swapSub, "victim.tmp"), "scanned junk");
+            string outsideFile = Path.Combine(outside, "victim.tmp");
+            File.WriteAllText(outsideFile, "MUST SURVIVE");
+
+            var swapRule = new CleanRule
+            {
+                Id = "test_swap_rule",
+                Name = "Test Junction Swap Rule",
+                Category = CleanCategory.SystemJunk,
+                Risk = RiskLevel.Safe,
+                DefaultSelected = true,
+                Targets = new List<CleanTargetSpec> { new CleanTargetSpec { PathPattern = swapRoot, Recursive = true } }
+            };
+
+            RuleScanResult scan = engine.ScanSingleRule(swapRule, CancellationToken.None);
+            Assert(scan.FileCount == 1, string.Format("Swap test should scan 1 file, got {0}", scan.FileCount));
+
+            // Attacker: replace the scanned sub-directory with a junction pointing elsewhere.
+            File.Delete(Path.Combine(swapSub, "victim.tmp"));
+            Directory.Delete(swapSub);
+            bool junctionCreated = CreateJunction(swapSub, outside);
+            Assert(junctionCreated, "Test setup: junction must be created");
+
+            try
+            {
+                CleanExecutionReport report = engine.CleanAsync(
+                    new List<RuleScanResult> { scan },
+                    new CleanOptions { IsDryRun = false },
+                    null,
+                    CancellationToken.None).Result;
+
+                Assert(File.Exists(outsideFile), "File reached through a swapped-in junction MUST survive");
+                Assert(report.DeletedFiles == 0 && report.ProtectedSkippedFiles == 1,
+                    string.Format("Redirected delete must be blocked and counted as protected (deleted={0}, protected={1})", report.DeletedFiles, report.ProtectedSkippedFiles));
+
+                string detail;
+                SafeOpOutcome dirOutcome = NativeFileScanner.TrySafeDelete(Path.Combine(swapSub, "emptydir"), true, guard, out detail);
+                Assert(dirOutcome == SafeOpOutcome.Redirected && Directory.Exists(Path.Combine(outside, "emptydir")),
+                    "Empty-directory delete through a junction must be refused");
+            }
+            finally
+            {
+                if (junctionCreated)
+                {
+                    // Removes only the link itself, never the target.
+                    try { Directory.Delete(swapSub); } catch { }
+                }
+            }
+        }
+
+        // 13. "Skip files modified within N minutes" is re-evaluated at delete time, not just at scan time
+        private static void RunAgeRecheckTests(CleanerEngine engine, string sandboxRoot)
+        {
+            string dir = Path.Combine(sandboxRoot, "AgeRecheck");
+            Directory.CreateDirectory(dir);
+            string staleFile = Path.Combine(dir, "stale.tmp");
+            string reusedFile = Path.Combine(dir, "reused.tmp");
+            File.WriteAllText(staleFile, new string('S', 700));
+            File.WriteAllText(reusedFile, new string('U', 300));
+            DateTime old = DateTime.Now.AddMinutes(-20);
+            File.SetLastWriteTime(staleFile, old);
+            File.SetLastWriteTime(reusedFile, old);
+
+            var tempRule = new CleanRule
+            {
+                Id = "test_age_rule",
+                Name = "Test Age Recheck Rule",
+                Category = CleanCategory.SystemJunk,
+                Risk = RiskLevel.Safe,
+                DefaultSelected = true,
+                Targets = new List<CleanTargetSpec> { new CleanTargetSpec { PathPattern = dir, Recursive = true, MinAgeMinutes = 5 } }
+            };
+
+            RuleScanResult scan = engine.ScanSingleRule(tempRule, CancellationToken.None);
+            Assert(scan.FileCount == 2 && scan.Items.All(x => x.MinAgeMinutes == 5), "Age test: both old files scanned and tagged with the 5-minute threshold");
+
+            // After the scan, an installer starts using one of the files again.
+            File.WriteAllText(reusedFile, "in use again");
+
+            CleanExecutionReport report = engine.CleanAsync(
+                new List<RuleScanResult> { scan },
+                new CleanOptions { IsDryRun = false },
+                null,
+                CancellationToken.None).Result;
+
+            Assert(File.Exists(reusedFile), "File modified after the scan (now inside the 5-minute window) MUST survive");
+            Assert(!File.Exists(staleFile), "Untouched old file should still be deleted");
+            Assert(report.DeletedFiles == 1 && report.ProtectedSkippedFiles == 1,
+                string.Format("Age recheck: expected 1 deleted / 1 protected, got {0} / {1}", report.DeletedFiles, report.ProtectedSkippedFiles));
+        }
+
+        // 14. Single-instance gate: an elevated restart waits for the old instance instead of bailing out
+        private static void RunSingleInstanceGateTests()
+        {
+            string name = @"Local\SmartCCleaner_TestGate_" + Guid.NewGuid().ToString("N");
+            var held = new ManualResetEvent(false);
+            var release = new ManualResetEvent(false);
+
+            var holder = new Thread(() =>
+            {
+                using (SingleInstanceGate gate = SingleInstanceGate.Acquire(name, 0))
+                {
+                    held.Set();
+                    release.WaitOne(10000);
+                }
+            });
+            holder.Start();
+            held.WaitOne(5000);
+
+            using (SingleInstanceGate second = SingleInstanceGate.Acquire(name, 0))
+            {
+                Assert(!second.IsOwner, "Normal second launch must NOT get the instance lock while the first is running");
+            }
+
+            bool waiterGotLock = false;
+            var waiter = new Thread(() =>
+            {
+                using (SingleInstanceGate gate = SingleInstanceGate.Acquire(name, 5000))
+                {
+                    waiterGotLock = gate.IsOwner;
+                }
+            });
+            waiter.Start();
+            Thread.Sleep(300);
+            release.Set(); // old instance shuts down
+            waiter.Join(10000);
+            holder.Join(10000);
+            Assert(waiterGotLock, "Elevated restart must take over the lock once the old instance exits");
+
+            string abandonedName = @"Local\SmartCCleaner_TestGate_" + Guid.NewGuid().ToString("N");
+            var crashed = new Thread(() =>
+            {
+                // Simulates a crash: lock taken, thread ends without releasing it.
+                SingleInstanceGate.Acquire(abandonedName, 0);
+            });
+            crashed.Start();
+            crashed.Join(5000);
+            using (SingleInstanceGate afterCrash = SingleInstanceGate.Acquire(abandonedName, 1000))
+            {
+                Assert(afterCrash.IsOwner, "A lock abandoned by a crashed instance must be taken over");
+            }
+        }
+
+        private static bool CreateJunction(string link, string target)
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "cmd.exe",
+                Arguments = string.Format("/c mklink /J \"{0}\" \"{1}\"", link, target),
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true
+            };
+            using (Process p = Process.Start(psi))
+            {
+                p.StandardOutput.ReadToEnd();
+                p.WaitForExit();
+                return p.ExitCode == 0 && NativeFileScanner.IsReparsePointFast(link);
             }
         }
 

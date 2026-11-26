@@ -401,7 +401,7 @@ namespace SmartCCleaner
 
             _recycleMediumCheck = new CheckBox
             {
-                Content = "常用/开发缓存优先移入回收站（提供一层可撤销保护）",
+                Content = "常用/开发缓存优先移入回收站（可撤销，但清空回收站前不释放空间）",
                 IsChecked = _settings.MoveNonSafeToRecycleBin,
                 FontSize = 12,
                 Foreground = UiTheme.TextSecondary,
@@ -409,8 +409,8 @@ namespace SmartCCleaner
                 HorizontalAlignment = HorizontalAlignment.Right,
                 VerticalContentAlignment = VerticalAlignment.Center
             };
-            _recycleMediumCheck.Checked += delegate { PersistSettings(); };
-            _recycleMediumCheck.Unchecked += delegate { PersistSettings(); };
+            _recycleMediumCheck.Checked += delegate { PersistSettings(); UpdateHeroTotals(); };
+            _recycleMediumCheck.Unchecked += delegate { PersistSettings(); UpdateHeroTotals(); };
             actionStack.Children.Add(_recycleMediumCheck);
 
             Grid.SetColumn(actionStack, 2);
@@ -995,6 +995,13 @@ namespace SmartCCleaner
             try
             {
                 _scanResults = await _engine.ScanAsync(_rules, progress, _cts.Token);
+                for (int i = 0; i < _scanResults.Count; i++)
+                {
+                    if (_scanResults[i].IsSelected && !IsDefaultSelected(_scanResults[i]))
+                    {
+                        _scanResults[i].IsSelected = false;
+                    }
+                }
                 sw.Stop();
                 _heroProgress.Value = 100;
                 RefreshDriveGauge();
@@ -1046,9 +1053,12 @@ namespace SmartCCleaner
 
             bool isDryRun = _dryRunCheck.IsChecked == true;
             bool moveNonSafeToRecycle = _recycleMediumCheck.IsChecked == true;
-            long selectedBytes = selected.Sum(r => r.TotalBytes);
             int selectedFiles = selected.Sum(r => r.FileCount);
             int nonSafeCount = selected.Count(r => r.Rule.Risk != RiskLevel.Safe);
+            // 只把会被彻底删除的部分算作「预计释放」；移入回收站的部分单独在保护策略提示里说明。
+            long selectedBytes = selected
+                .Where(r => !(moveNonSafeToRecycle && r.Rule.Risk != RiskLevel.Safe))
+                .Sum(r => r.TotalBytes);
             List<string> runningApps = selected
                 .SelectMany(r => r.RunningProcesses)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -1058,9 +1068,15 @@ namespace SmartCCleaner
                 ? string.Format("\n• 检测到运行中的关联程序：{0}（被占用文件将自动安全跳过）", string.Join(", ", runningApps))
                 : "";
 
-            string recycleHint = (!isDryRun && nonSafeCount > 0 && moveNonSafeToRecycle)
-                ? "\n• 保护策略：已开启「常用/开发缓存优先移入回收站（可撤销）」"
+            string recycleHint = (nonSafeCount > 0 && moveNonSafeToRecycle)
+                ? "\n• 保护策略：常用/开发缓存将移入回收站（可撤销）；回收站同在 C 盘，清空回收站后才会真正释放这部分空间"
                 : "";
+
+            bool emptiesRecycleBin = selected.Any(r => r.Rule.Id == "sys_recycle_bin");
+            if (emptiesRecycleBin && nonSafeCount > 0 && moveNonSafeToRecycle)
+            {
+                recycleHint += "\n• 注意：同时勾选了「C盘回收站」。本次移入的文件会保留，但之后再清空回收站时将被永久删除";
+            }
 
             string confirmMsg = string.Format(
                 "即将执行：{0}\n\n" +
@@ -1120,15 +1136,24 @@ namespace SmartCCleaner
                 RefreshDriveGauge();
                 RefreshLogsView();
 
+                string recycledLine = report.RecycledFiles > 0
+                    ? string.Format("• {0}移入回收站：{1}（{2} 个文件，仍占用 C 盘，清空回收站后才释放）\n",
+                        isDryRun ? "预计" : "已",
+                        FormatHelper.FormatBytes(report.RecycledBytes),
+                        report.RecycledFiles)
+                    : "";
+
                 string summary = string.Format(
                     "{0}完成！\n\n" +
                     "• {1}空间：{2}\n" +
-                    "• 彻底删除：{3} 个 | 移入回收站：{4} 个 | 清理空目录：{5} 个\n" +
-                    "• 安全跳过：{6} 个（白名单/防误删拦截 {7} 个，占用或权限不足 {8} 个）\n\n" +
+                    "{3}" +
+                    "• 彻底删除：{4} 个 | 移入回收站：{5} 个 | 清理空目录：{6} 个\n" +
+                    "• 安全跳过：{7} 个（白名单/防误删拦截 {8} 个，占用或权限不足 {9} 个）\n\n" +
                     "完整无截断审计日志已自动保存，可前往「清理审计日志」查看。",
                     isDryRun ? "模拟演练" : "一键清理",
-                    isDryRun ? "预计可释放" : "成功处理",
+                    isDryRun ? "预计可释放" : "实际释放",
                     FormatHelper.FormatBytes(report.FreedBytes),
+                    recycledLine,
                     report.DeletedFiles,
                     report.RecycledFiles,
                     report.DeletedDirectories,
@@ -1147,7 +1172,10 @@ namespace SmartCCleaner
                 }
                 else
                 {
-                    _heroTitleText.Text = string.Format("演练完成：预计可释放 {0}（未删除真实文件）", FormatHelper.FormatBytes(report.FreedBytes));
+                    _heroTitleText.Text = report.RecycledBytes > 0
+                        ? string.Format("演练完成：预计可释放 {0}，另有 {1} 将移入回收站（未删除真实文件）",
+                            FormatHelper.FormatBytes(report.FreedBytes), FormatHelper.FormatBytes(report.RecycledBytes))
+                        : string.Format("演练完成：预计可释放 {0}（未删除真实文件）", FormatHelper.FormatBytes(report.FreedBytes));
                     _heroSubText.Text = "可在「清理审计日志」中逐条审阅演练明细，确认无误后取消勾选「演练模式」即可真实清理。";
                 }
             }
@@ -1467,9 +1495,15 @@ namespace SmartCCleaner
             }
             else
             {
-                _heroTitleText.Text = string.Format("已勾选可释放 {0}（共扫描发现 {1}）",
-                    FormatHelper.FormatBytes(selectedBytes),
-                    FormatHelper.FormatBytes(totalFound));
+                long recycleBound = SelectedRecycleBoundBytes();
+                _heroTitleText.Text = recycleBound > 0
+                    ? string.Format("已勾选可释放 {0}，另有 {1} 将移入回收站（共扫描发现 {2}）",
+                        FormatHelper.FormatBytes(selectedBytes - recycleBound),
+                        FormatHelper.FormatBytes(recycleBound),
+                        FormatHelper.FormatBytes(totalFound))
+                    : string.Format("已勾选可释放 {0}（共扫描发现 {1}）",
+                        FormatHelper.FormatBytes(selectedBytes),
+                        FormatHelper.FormatBytes(totalFound));
                 _heroSubText.Text = string.Format("已勾选 {0} 类规则 / {1} 个文件。浏览器、常用软件与开发工具缓存默认未勾选，可按需手动选择。",
                     selectedRulesCount, selectedFiles);
             }
@@ -1500,6 +1534,31 @@ namespace SmartCCleaner
             }
         }
 
+        /// <summary>
+        /// 已勾选、且会被移入回收站（而非彻底删除）的体积：这部分不会腾出 C 盘空间。
+        /// </summary>
+        private long SelectedRecycleBoundBytes()
+        {
+            if (_recycleMediumCheck == null || _recycleMediumCheck.IsChecked != true) return 0;
+            return _scanResults
+                .Where(r => r.IsSelected && r.Rule.Risk != RiskLevel.Safe)
+                .Sum(r => r.TotalBytes);
+        }
+
+        /// <summary>
+        /// 开启「优先移入回收站」时，「C盘回收站」不再默认勾选：
+        /// 否则本次移入回收站的文件会在下一次一键清理时被永久清空，可撤销保护形同虚设。
+        /// </summary>
+        private bool IsDefaultSelected(RuleScanResult r)
+        {
+            if (!r.Rule.DefaultSelected) return false;
+            if (r.Rule.Id == "sys_recycle_bin" && _recycleMediumCheck != null && _recycleMediumCheck.IsChecked == true)
+            {
+                return false;
+            }
+            return true;
+        }
+
         private void ApplyQuickSelection(string mode)
         {
             for (int i = 0; i < _scanResults.Count; i++)
@@ -1517,7 +1576,7 @@ namespace SmartCCleaner
 
                 if (mode == "safe")
                 {
-                    r.IsSelected = r.Rule.DefaultSelected;
+                    r.IsSelected = IsDefaultSelected(r);
                 }
                 else if (mode == "all")
                 {
@@ -1735,6 +1794,7 @@ namespace SmartCCleaner
                 var psi = new ProcessStartInfo
                 {
                     FileName = exePath,
+                    Arguments = Program.ElevatedRestartArg,
                     UseShellExecute = true,
                     Verb = "runas"
                 };
